@@ -3,6 +3,7 @@ import express, {NextFunction, Request, Response} from 'express';
 import axios from 'axios';
 import sharp from 'sharp';
 import settings from '../settings.json';
+import {BaseError} from './lib/error';
 
 const logger = new Logger('Server');
 
@@ -10,6 +11,8 @@ const logRequest = (req: Request, res: Response, next: NextFunction) => {
     logger.info(req.originalUrl);
     next();
 };
+
+class StravaError extends BaseError {}
 
 async function getStrava(sw: string, x: string, y: string, zoom: string): Promise<Buffer> {
     const {policy, signature, keyPair} = settings.stravaCookies;
@@ -25,21 +28,7 @@ async function getStrava(sw: string, x: string, y: string, zoom: string): Promis
         logger.error(
             `Strava: (${zoom}, ${x}, ${y}) - ${e?.response?.status}: ${e?.response?.statusText}`
         );
-        return sharp({
-            create: {
-                width: 256,
-                height: 256,
-                channels: 4,
-                background: {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    alpha: 0,
-                },
-            },
-        })
-            .png()
-            .toBuffer();
+        throw new StravaError(e);
     }
 }
 
@@ -80,25 +69,37 @@ export async function runServer(): Promise<void> {
     app.use(logRequest);
 
     app.get('/:sw/:zoom/:x/:y', async (req, res) => {
-        const {sw, x, y, zoom} = req.params;
-        const strava = await getStrava(sw, x, y, zoom);
-        const dcsNSW = await getDCS(x, y, zoom);
+        try {
+            const {sw, x, y, zoom} = req.params;
+            const [strava, dcsNSW] = await Promise.all([
+                getStrava(sw, x, y, zoom),
+                getDCS(x, y, zoom),
+            ]);
 
-        const dcsImage = sharp(dcsNSW);
-        const dcsImageMeta = await dcsImage.metadata();
+            const dcsImage = sharp(dcsNSW);
+            const stravaImage = sharp(strava);
+            const stravaImageMeta = await stravaImage.metadata();
+            const dcsImageMeta = await dcsImage.metadata();
 
-        const resizedStrava = await sharp(strava)
-            .resize(dcsImageMeta.width ?? 256, dcsImageMeta.height ?? 256)
-            .png()
-            .toBuffer();
+            const width = Math.max(dcsImageMeta.width ?? 0, stravaImageMeta.width ?? 0);
+            const height = Math.max(dcsImageMeta.height ?? 0, stravaImageMeta.height ?? 0);
 
-        const combined = await dcsImage
-            .composite([{input: resizedStrava}])
-            .png()
-            .toBuffer();
+            const combined = await dcsImage
+                .resize(width, height)
+                .composite([{input: await stravaImage.resize(width, height).toBuffer()}])
+                .png()
+                .toBuffer();
 
-        res.contentType('image/png');
-        res.send(combined);
+            res.contentType('image/png');
+            res.send(combined);
+        } catch (e) {
+            if (e instanceof StravaError) {
+                res.status(404).send('Strava imagery not found');
+            } else {
+                res.status(500).send('Something went wrong');
+            }
+            logger.exception(e);
+        }
     });
 
     app.listen(port, () => {
